@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# One isolated worktree per reviewer.
+#
+#   guardrails-review-worktree [--repo DIR] <commit> <name>   build, link, smoke-test; prints the path
+#   guardrails-review-worktree [--repo DIR] --remove <name>   remove it again
+#
+# The repo is --repo, else the one the current directory is in. Files its
+# .worktreeinclude names (Claude Code's own list, gitignore syntax) are copied
+# from the main checkout when git ignores them, as Claude Code does for the
+# worktrees it makes. What gets linked and smoke-tested comes from
+# .claude/guardrails.conf (the local file first): `worktree_links` (paths git
+# ignores and too big to copy, such as node_modules, linked from the main
+# checkout) and `smoke` (commands run once in the new worktree). A repo with
+# none of these gets a bare worktree.
+#
+# Why: a worktree holds only tracked files, so a suite needing .env fails
+# there; and a shared worktree lets one reviewer's `git checkout` reach
+# another's run. Each reviewer gets its own, detached at <commit>.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+C="$here/../scripts/config.sh"
+dir=$PWD
+if [ "${1:-}" = "--repo" ]; then dir=${2:?--repo DIR}; shift 2; fi
+REPO=$("$C" root "$dir")
+[ -n "$REPO" ] || { echo "not in a git repo (use --repo DIR): $dir" >&2; exit 1; }
+BASE=${REVIEW_WT_BASE:-$(dirname "$REPO")/.review-worktrees}
+
+if [ "${1:-}" = "--remove" ]; then
+  wt="$BASE/${2:?name}"
+  git -C "$REPO" worktree remove --force "$wt"   # --force: the links are untracked
+  git -C "$REPO" worktree prune
+  echo "removed $wt"; exit 0
+fi
+
+commit=${1:?usage: guardrails-review-worktree [--repo DIR] <commit> <name>}; name=${2:?name}
+wt="$BASE/$name"
+[ -e "$wt" ] && { echo "exists: $wt (remove it first)" >&2; exit 1; }
+mkdir -p "$BASE"
+git -C "$REPO" worktree add --detach "$wt" "$commit" >/dev/null
+while IFS= read -r src; do
+  [ -n "$src" ] || continue
+  p=${src#"$REPO"/}
+  [ -e "$src" ] || { echo "missing in main checkout: $p" >&2; exit 1; }
+  mkdir -p "$(dirname "$wt/$p")"
+  ln -s "$src" "$wt/$p"
+  # Git Bash copies instead of linking unless native links are allowed.
+  [ -L "$wt/$p" ] || { echo "guardrails: $wt/$p is a copy, not a link. On Windows, set MSYS=winsymlinks:nativestrict and turn on Developer Mode (Settings > System > For developers), then remove this worktree and try again." >&2; exit 1; }
+done <<EOF
+$("$C" get "$REPO" worktree_links)
+EOF
+
+# .worktreeinclude: untracked files its patterns match, kept only where the
+# repo's own ignore rules ignore them too. A path already linked is left.
+copied=0
+if [ -f "$REPO/.worktreeinclude" ]; then
+  while IFS= read -r -d '' p; do
+    [ -e "$wt/$p" ] || [ -L "$wt/$p" ] && continue
+    mkdir -p "$(dirname "$wt/$p")"
+    cp -p "$REPO/$p" "$wt/$p"
+    copied=$((copied + 1))
+  done < <(git -C "$REPO" ls-files -z --others --ignored --exclude-from=.worktreeinclude \
+             | git -C "$REPO" check-ignore -z --stdin)
+fi
+
+cd "$wt"
+echo "worktree: $wt @ $(git rev-parse --short HEAD)"
+[ "$copied" = 0 ] || echo "copied from the main checkout: $copied file(s) .worktreeinclude names"
+failed=0; n=0
+while IFS= read -r c; do
+  [ -n "$c" ] || continue
+  n=$((n + 1))
+  if out=$( (bash -c "$c") 2>&1 ); then st=ok; else st=FAILED; failed=1; fi
+  line=$(grep -E 'passed|failed|error' <<<"$out" | tail -1) || true
+  line=${line:-$(grep -E '[a-z]' <<<"$out" | tail -1 || true)}
+  echo "smoke $n ($st): $(xargs <<<"$line")"
+done <<EOF
+$("$C" get "$REPO" smoke)
+EOF
+[ "$n" = 0 ] && echo "smoke: none configured for this repo (smoke = in .claude/guardrails.conf)"
+[ "$failed" = 0 ] || { echo "SMOKE FAILED -- do not hand this worktree to a reviewer" >&2; exit 1; }

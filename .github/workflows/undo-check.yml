@@ -1,0 +1,17 @@
+# The plugin's own undo check on every pull request (the copyable version is
+# examples/workflows/undo-check.yml). Its own file, so adding or removing the
+# `undo-ok` label re-runs only this check, not the test matrix.
+name: undo check
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+permissions:
+  contents: read
+jobs:
+  undo-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - run: bash scripts/undo-check-ci.sh

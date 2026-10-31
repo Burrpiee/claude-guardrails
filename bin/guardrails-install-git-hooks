@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Put the undo check inside `git push`, so it covers every push -- from a
+# terminal or an IDE too -- and sees a commit made in the same command.
+#
+#   guardrails-install-git-hooks [--data DIR] [repo...]   install
+#   guardrails-install-git-hooks --remove [repo...]       take it out again
+#
+# With no repo named: the repo the current folder is in, and its partners.
+# Each repo gets a small .git/hooks/pre-push (a file, not a link: plain
+# Windows has none) that runs the check's copy in the plugin's data folder,
+# since the plugin's own folder moves on every update. DIR is that folder
+# (${CLAUDE_PLUGIN_DATA}; the setup skill and the push guard spell it out);
+# without --data it is worked out from where Claude Code keeps this plugin.
+# The copy is written there when missing and refreshed at each session start.
+# If the copy disappears (the plugin uninstalled), the stub warns and lets
+# every push through: remove the stubs before uninstalling.
+#
+# Never replaces a pre-push hook the repo already has, nor writes into a
+# hooks folder inside the repo's files (a husky-style core.hooksPath, where
+# it would be committed) or one every repo shares (a global core.hooksPath);
+# safe to rerun. A repo's worktrees share its hooks; a new clone needs this
+# run again. Exits 1 when any repo could not be given the hook, or none was
+# found.
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/.." && pwd)
+. "$root/scripts/lib.sh"
+C="$root/scripts/config.sh"
+MARK="guardrails-undo-check-stub"
+data=""; remove=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --data) data=${2:?--data DIR}; shift 2 ;;
+    --remove) remove=1; shift ;;
+    *) break ;;
+  esac
+done
+
+repos=("$@")
+if [ ${#repos[@]} -eq 0 ]; then
+  while IFS= read -r r; do [ -n "$r" ] && repos+=("$r"); done <<EOF
+$("$C" repos "$PWD")
+EOF
+  [ ${#repos[@]} -gt 0 ] || { echo "not in a git repo, and no repo named; nothing done"; exit 1; }
+fi
+
+# where git looks for REPO's hooks, absolute; empty when not a repo
+hooks_dir() { git -C "$1" rev-parse --path-format=absolute --git-path hooks 2>/dev/null; }
+
+if [ -n "$remove" ]; then
+  status=0
+  for r in "${repos[@]}"; do
+    d=$(hooks_dir "$r") || { echo "$r: not a git repo"; status=1; continue; }
+    if grep -q "$MARK" "$d/pre-push" 2>/dev/null; then
+      rm -f "$d/pre-push" && echo "$r: removed"
+    else
+      echo "$r: no undo check stub here; left as it is"
+    fi
+  done
+  exit $status
+fi
+
+# The data folder: --data, else CLAUDE_PLUGIN_DATA, else the folder Claude Code
+# gives this plugin: .../plugins/cache/<marketplace>/<plugin>/<version> keeps
+# its data in .../plugins/data/<plugin>-<marketplace>. A guess is used only
+# if that folder exists (every session start makes it): one that does not may
+# mean Claude Code keeps it elsewhere now, where a copy here would never be
+# refreshed.
+data=${data:-${CLAUDE_PLUGIN_DATA:-}}
+if [ -z "$data" ]; then
+  v=$(dirname "$root"); plugin=$(basename "$v"); mkt=$(basename "$(dirname "$v")")
+  cache=$(dirname "$(dirname "$v")")
+  if [ "$(basename "$cache")" = cache ]; then
+    guess="$(dirname "$cache")/data/$plugin-$mkt"
+    [ -d "$guess" ] || { echo "the plugin's data folder is not at $guess yet; start a Claude Code session first, or pass --data <the plugin's data folder> (the setup skill shows it)"; exit 1; }
+    data=$guess
+  fi
+fi
+[ -n "$data" ] || { echo "cannot tell where the plugin keeps its data; run this again with --data <the plugin's data folder> (the setup skill shows it)"; exit 1; }
+data=$(gr_abspath "$data")
+copy="$data/git-hooks/pre-push"
+mkdir -p "$data/git-hooks" || { echo "cannot write to $data/git-hooks; nothing installed"; exit 1; }
+for f in git-hooks/pre-push scripts/undo-check.sh scripts/lib.sh; do
+  cmp -s "$root/$f" "$data/git-hooks/${f##*/}" || cp "$root/$f" "$data/git-hooks/${f##*/}" \
+    || { echo "cannot copy $f into $data/git-hooks; nothing installed"; exit 1; }
+done
+
+q=$(printf '%s' "$copy" | sed "s/'/'\\\\''/g")
+stub="#!/bin/sh
+# $MARK: written by guardrails-install-git-hooks (the guardrails plugin's undo
+# check); take it out with guardrails-install-git-hooks --remove.
+copy='$q'
+[ -f \"\$copy\" ] || { echo \"guardrails: the undo check is missing (\$copy), so this push is not checked; run guardrails-install-git-hooks again, or --remove.\" >&2; exit 0; }
+command -v bash >/dev/null 2>&1 || { echo \"guardrails: bash not found, so this push is not checked.\" >&2; exit 0; }
+exec bash \"\$copy\" \"\$@\""
+
+status=0
+for r in "${repos[@]}"; do
+  d=$(hooks_dir "$r") || { echo "$r: not a git repo"; status=1; continue; }
+  top=$(git -C "$r" rev-parse --show-toplevel 2>/dev/null)
+  gitdir=$(git -C "$r" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  dest="$d/pre-push"
+  if [ -n "$(git -C "$r" config core.hooksPath)" ] && [ -z "$(git -C "$r" config --local core.hooksPath)" ]; then
+    echo "$r: git's hooks folder $d comes from a setting shared by every repo (a global core.hooksPath); left as it is (call $copy from that folder's own pre-push to add the undo check)"
+    status=1
+  elif [ -n "$top" ] && case "$d/" in "$gitdir/"*) false ;; "$top/"*) true ;; *) false ;; esac; then
+    echo "$r: its hooks folder $d is inside the repo's files (core.hooksPath), where the hook would be committed; left as it is (call $copy from its own pre-push to add the undo check)"
+    status=1
+  elif grep -q "$MARK" "$dest" 2>/dev/null; then
+    if [ "$(cat "$dest")" = "$stub" ]; then echo "$r: already installed"
+    else printf '%s\n' "$stub" > "$dest" && echo "$r: updated ($dest)" || status=1; fi
+  elif [ -e "$dest" ] || [ -L "$dest" ]; then
+    echo "$r: already has its own $dest; left as it is (call $copy from it to add the undo check)"
+    status=1
+  else
+    mkdir -p "$d" && printf '%s\n' "$stub" > "$dest" && chmod +x "$dest" && echo "$r: installed ($dest)" || status=1
+  fi
+done
+exit $status

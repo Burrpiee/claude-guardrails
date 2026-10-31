@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# guardrails-owed-check [dir] -- backlog items still marked "ruling owed" that
+# the decision log already cites, i.e. rulings that may have been made while
+# the backlog lagged. A mention is not a ruling: each hit shows the citing
+# line, for a person to confirm. A session told "ruling owed" by its notes
+# re-asks a settled question unless something points at the log. Free.
+#
+# The files are the `decisions` and `backlog` of the project's
+# .claude/guardrails.conf (defaults docs/DECISIONS.md and docs/decisions/,
+# docs/BACKLOG.md), in the repo at <dir> or its partners; silent when either
+# is missing. `decisions` may repeat, and each may be a log file or a folder
+# of records (every *.md in it but README.md, index.md and an unnumbered
+# *-index.md). The backlog's items are "## X. Name" sections of "12." /
+# "13m." list items; the log cites them as "BACKLOG X.12" under "### "
+# headings, a record by its "# " title, where a bare "X.12" counts too.
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/../scripts/lib.sh"
+C="$here/../scripts/config.sh"
+dir=${1:-$PWD}
+# Python on Windows cannot open a Git Bash path (/c/...): hand it the native one.
+native() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s\n' "$1"; fi; }
+backlog=""; set --
+while IFS= read -r r; do
+  [ -n "$r" ] && [ -n "$("$C" project "$r")" ] || continue
+  b=$("$C" get "$r" backlog | head -1)
+  [ -f "$b" ] || continue
+  set --
+  while IFS= read -r d; do
+    if [ -f "$d" ]; then set -- "$@" "log:$(native "$d")"
+    elif [ -d "$d" ]; then
+      nd=$(native "$d")   # once a folder: each cygpath is a process start
+      for f in "$d"/*.md; do
+        [ -f "$f" ] || continue
+        case "${f##*/}" in README.md|index.md) continue ;; [0-9]*) ;; *-index.md) continue ;; esac
+        set -- "$@" "record:$nd/${f##*/}"
+      done
+    fi
+  done <<EOF2
+$("$C" get "$r" decisions)
+EOF2
+  [ $# -gt 0 ] && { backlog=$(native "$b"); break; }
+done <<EOF
+$("$C" repos "$dir")
+EOF
+[ -n "$backlog" ] || exit 0
+py=$(gr_python) || { gr_no_python guardrails-owed-check; exit 1; }
+
+"$py" - "$backlog" "$@" <<'PY'
+import re, sys
+# Windows Python would print in the code page (no "→") and end lines with \r\n.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+backlog = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+
+# Backlog items: "## X. Name" sections holding "12." / "13m." list items.
+items, letter, cur = [], None, None
+for line in backlog.splitlines():
+    h = re.match(r"^## ([A-Z]+)\.", line)
+    if h:
+        letter, cur = h.group(1), None
+        continue
+    m = re.match(r"^(\d+[a-z]*)\.\s", line)
+    if m and letter:
+        cur = [f"{letter}.{m.group(1)}", line]
+        items.append(cur)
+    elif cur is not None:
+        cur.append(line)
+
+def open_owed(text):
+    text = re.sub(r"~~.*?~~", "", text, flags=re.S)  # struck text is settled
+    return re.search(r"rulings? owed", text, re.I) is not None
+
+owed = [it[0] for it in items if open_owed("\n".join(it[1:]))]
+
+# Each source's text and, per line, the name a citation there is shown by:
+# a log's "### " heading, a record's "# " title.
+sources = []
+for arg in sys.argv[2:]:
+    kind, path = arg.split(":", 1)
+    text = open(path, encoding="utf-8", errors="replace").read()
+    names = []
+    if kind == "log":
+        head = None
+        for line in text.splitlines():
+            if line.startswith("### "):
+                head = "DECISIONS " + line[4:].split(" -- ")[0][:60]
+            names.append(head)
+    else:
+        title = next((l[2:].strip() for l in text.splitlines() if l.startswith("# ")),
+                     path.rsplit("/", 1)[-1])
+        names = [title[:60]] * len(text.splitlines())
+    sources.append((kind, text, names))
+
+hits = []
+for item in owed:
+    num = item.split(".", 1)[1]
+    # "BACKLOG X.12", or a bare "13m" (a letter-suffixed number is unique);
+    # in a record also a bare "X.12", as in "on the BACKLOG (X.12, X.13)"
+    alt = "|" + r"(?<![\w.])" + re.escape(num) if re.search(r"[a-z]$", num) else ""
+    where = []
+    for kind, text, names in sources:
+        bare = "|" + r"(?<![\w.])" + re.escape(item) if kind == "record" else ""
+        pat = re.compile(r"(?:BACKLOG\s+" + re.escape(item) + alt + bare + r")(?![0-9a-z])")
+        lines = text.splitlines()
+        for m in pat.finditer(text):
+            n = text.count("\n", 0, m.start())
+            cite = (names[n] or "DECISIONS (top)", lines[n].strip()[:110])
+            if cite not in where:
+                where.append(cite)
+    if where:
+        hits.append((item, where))
+
+if hits:
+    print(f"owed-check: {len(owed)} backlog item(s) still say 'ruling owed'; "
+          f"{len(hits)} mentioned in the decision log. A mention is not a ruling: strike "
+          f"one only on a quoted ruling of that question.")
+    for item, where in hits[:8]:
+        for head, line in where[:2]:
+            print(f"  BACKLOG {item} <- {head}: \"{line}\"")
+PY
+exit 0

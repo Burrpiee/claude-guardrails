@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# guardrails-handoff-check [launch-dir] -- does a FRESH session pick up the
+# handoff correctly? Asks one headless Sonnet session (read-only tools, no
+# session saved) the four questions every next session faces, from the launch
+# directory (default: the repo the current directory is in), and prints its
+# answers to read against what the handoff wrote.
+# Cost: one call, about 0.15 USD at API prices, counted against usage on a
+# subscription.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/../scripts/lib.sh"
+py=$(gr_python) || { gr_no_python guardrails-handoff-check; exit 1; }
+DIR="${1:-$("$here/../scripts/config.sh" root "$PWD")}"
+DIR="${DIR:-$PWD}"
+cd "$DIR"
+out=$(claude -p "You are starting a new session. Answer each in at most three sentences, numbered:
+1. What happened last session, and what should we do first?
+2. What is waiting on the user (decisions, merges, deploys)?
+3. Which branches are pushed but unmerged in each repo, and what is on each? Check git, not only memory.
+4. Are any proposed process fixes awaiting the user's decision?
+Then a line SOURCES: listing the files you read. Do not run anything that changes state." \
+  --model sonnet --output-format json --tools "Read,Grep,Glob" --no-session-persistence < /dev/null 2>/dev/null) || true   # a failed call still prints its JSON
+"$py" - "$out" <<'PY'
+import json, sys
+# Windows Python would print in the code page (no "→") and end lines with \r\n.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+s = sys.argv[1]
+try:
+    d = json.loads(s[s.index("{"):])
+except Exception:
+    print("(no JSON reply -- a usage limit? `exited 1` with duration_api_ms 0 means yes)")
+    sys.exit(1)
+u = d.get("usage", {})
+tok = sum(u.get(k, 0) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+print(d.get("result", "(no result)"))
+if d.get("is_error"):
+    sys.exit(1)
+print(f"\n-- {d.get('num_turns')} turns, {tok} input tokens, ${d.get('total_cost_usd', 0):.3f} nominal, models {list(d.get('modelUsage', {}))}")
+PY

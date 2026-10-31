@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# guardrails-instructions-check -- do the instruction files still give the
+# right answers?
+#
+#   guardrails-instructions-check <questions.md> <launch-dir> [id ...]
+#
+# Asks each question of the table in <questions.md> (rows `| ID | Question |
+# Expected |`, IDs like A01) in its own FRESH headless Sonnet session launched
+# from <launch-dir> (a worktree of the branch under test, or a repo root),
+# with read-only tools and no saved session, one at a time (in parallel they
+# only reach a usage limit sooner). Partner repos in .claude/guardrails.conf
+# are added, with their CLAUDE.md, so a question answered by a partner's
+# rules tests the real setup. Prints question, expected and answer for
+# grading by hand; a run ends with the total nominal cost.
+# Cost: ~$0.05-0.15 nominal a question on a subscription. Run it after a
+# change to CLAUDE.md or .claude/rules, not routinely. DRY=1 lists the parsed
+# questions and spends nothing. Keep the questions file OUTSIDE the repo under
+# test, so a test session searching the repo cannot find the answers.
+# Template: examples/instruction-questions.md.
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/../scripts/lib.sh"
+py=$(gr_python) || { gr_no_python guardrails-instructions-check; exit 1; }
+[ $# -ge 2 ] || { echo "usage: guardrails-instructions-check <questions.md> <launch-dir> [id ...]" >&2; exit 2; }
+Q=$(gr_abspath "$1"); DIR=$2; shift 2
+[ -f "$Q" ] || { echo "no questions file: $Q" >&2; exit 1; }
+ONLY=" $* "
+cd "$DIR" || exit 1
+add=()
+if [ -n "$("$here/../scripts/config.sh" project "$PWD")" ]; then
+  while IFS= read -r p; do [ -n "$p" ] && [ -d "$p" ] && add+=(--add-dir "$p"); done <<EOF
+$("$here/../scripts/config.sh" get "$PWD" partners)
+EOF
+fi
+if [ ${#add[@]} -gt 0 ]; then export CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1
+else unset CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD; fi
+total=0
+while IFS='|' read -r _ id q exp _; do
+  id=$(xargs <<<"$id"); q=$(sed 's/^ *//; s/ *$//' <<<"$q"); exp=$(sed 's/^ *//; s/ *$//' <<<"$exp")
+  [[ "$id" =~ ^[A-Z][0-9]+$ ]] || continue
+  [ "$ONLY" != "  " ] && [[ "$ONLY" != *" $id "* ]] && continue
+  if [ -n "${DRY:-}" ]; then printf '%s | %s | %s\n' "$id" "$q" "$exp"; continue; fi
+  out=$(claude -p "You are starting work in this repository. Answer from its instructions and code, in at most five sentences, and name the file(s) the answer comes from. Do not run anything that changes state or spends. Question: $q" \
+    ${add[@]+"${add[@]}"} --model sonnet --output-format json --tools "Read,Grep,Glob" --no-session-persistence < /dev/null 2>/dev/null)
+  res=$("$py" - "$out" <<'PY'
+import json, sys
+# Windows Python would print in the code page (no "→") and end lines with \r\n.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+s = sys.argv[1]
+try:
+    d = json.loads(s[s.index("{"):])
+except Exception:
+    print("(no JSON reply -- a usage limit? `exited 1` with duration_api_ms 0 means yes)\n0"); sys.exit()
+print(d.get("result", "(no result)").strip()); print(d.get("total_cost_usd", 0) or 0)
+PY
+)
+  cost=$(tail -1 <<<"$res"); total=$("$py" -c "print(round($total + $cost, 4))" | tr -d '\r')
+  printf '\n=== %s: %s\nEXPECTED: %s\nANSWER:\n%s\n(-- $%s)\n' "$id" "$q" "$exp" "$(sed '$d' <<<"$res")" "$cost"
+done < "$Q"
+[ -n "${DRY:-}" ] || { echo; echo "TOTAL nominal: \$$total"; }

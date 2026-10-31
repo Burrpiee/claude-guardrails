@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# guardrails-write-block <block-file> <target-CLAUDE.md> -- put one of the
+# setup skill's blocks into a CLAUDE.md, once.
+#
+# The block file's first line names it: <!-- guardrails:<name> v<N> -->. The
+# block goes into the target between that line and <!-- /guardrails:<name> -->.
+# A block of that name already there (any version) is replaced in place;
+# otherwise it is appended after one blank line; a missing target is
+# created. Text outside the markers keeps its bytes, except that a last line
+# with no line ending gets one; in a CRLF file (every line ending in CR) the
+# block and that line end CRLF. Git Bash's awk drops each CR it reads, so awk
+# is handed the file with every CR swapped for \001 and the swap undone
+# after; a target already holding \001 is refused when awk would rewrite it
+# (an update or a removal; an append does not). Bytes are read as bytes
+# (LC_ALL=C: macOS's tr stops on a byte that is not UTF-8 otherwise).
+# An update or a removal swaps a finished copy in, so a crash cannot leave half
+# a file. With a symlink as the target the file it points at is swapped and the
+# link survives, as git config does; permissions are kept; a read-only file is
+# refused, as an append refuses it.
+# Prints `added`, `updated` or `unchanged` (the file left byte-identical).
+#
+#   guardrails-write-block --remove <name> <target>   takes the block out again
+#   (and the blank line before it); prints `removed`, or `absent`.
+set -uo pipefail
+export LC_ALL=C
+CR=$'\r'
+# A CRLF file: every line ends in CR. Counted behind the \001 stand-in, since
+# Git Bash's grep and awk drop a line's CR on reading.
+is_crlf() {
+  local n c
+  n=$(wc -l < "$1" | tr -d ' '); c=$(tr '\r' '\001' < "$1" | grep -ac "$(printf '\001')\$")
+  [ "$n" -gt 0 ] && [ "$c" -ge "$n" ]
+}
+no_soh() {
+  local n
+  n=$(grep -an "$(printf '\001')" "$1" | head -1 | cut -d: -f1)
+  [ -z "$n" ] && return 0
+  echo "guardrails-write-block: line $n of $1 holds a Ctrl-A control character (byte 0x01), which this tool uses in place of CR while it edits; delete it, then try again" >&2
+  return 1
+}
+unreadable() { echo "guardrails-write-block: could not read $1; nothing changed" >&2; exit 1; }
+unwritable() { echo "guardrails-write-block: could not rewrite $1; nothing changed" >&2; exit 1; }
+# Names every open marker's line: a quoted one is not where a reader would look.
+unclosed() {
+  local n
+  n=$(grep -anE "^<!-- guardrails:$2 v[0-9]+ -->$CR?\$" < "$1" | cut -d: -f1 | tr '\n' ' ')
+  echo "guardrails-write-block: $1 opens a $2 block but never closes it (open markers on lines: ${n% }); fix it by hand" >&2
+  exit 1
+}
+# Sets real: the file a path names, links followed. A link loop never gets
+# here: [ -e ] is false for one. Each `&& echo .` keeps a name's last newline
+# from $(...), which would otherwise name the file beside it; -n because
+# macOS's readlink adds no newline to a target already ending in one.
+real_path() {
+  local l d
+  real=$1
+  while [ -L "$real" ]; do
+    l=$(readlink -n "$real" && echo .) || return 1; l=${l%.}
+    case $l in /*) real=$l ;; *) d=$(dirname "$real" && echo .); real=${d%??}/$l ;; esac
+  done
+}
+# Sets real and tmp. The temp file starts as a copy, for the permissions, and
+# sits beside the real file: a rename across disks is not all-or-nothing.
+start_swap() {
+  real_path "$1" || unwritable "$1"
+  [ -w "$real" ] || { echo "guardrails-write-block: could not rewrite $real: it is read-only; nothing changed" >&2; exit 1; }
+  tmp="$real.guardrails-tmp.$$"
+  cp -p "$real" "$tmp" || { rm -f "$tmp"; unwritable "$1"; }
+}
+if [ "${1:-}" = "--remove" ]; then
+  name=${2:-}; target=${3:-}
+  printf '%s\n' "$name" | grep -qE '^[a-z0-9-]+$' && [ -n "$target" ] \
+    || { echo "usage: guardrails-write-block --remove <name> <target-CLAUDE.md>" >&2; exit 2; }
+  [ -e "$target" ] || { echo absent; exit 0; }
+  grep -qE "^<!-- guardrails:$name v[0-9]+ -->$CR?\$" "$target" 2>/dev/null; rc=$?
+  [ "$rc" = 1 ] && { echo absent; exit 0; }
+  [ "$rc" = 0 ] || unreadable "$target"
+  no_soh "$target" || exit 1
+  # Without this, a block that never closes takes the rest of the file with it.
+  # An open marker inside a block counts as never closing: a later block's close
+  # would otherwise take everything between.
+  tr '\r' '\001' < "$target" | awk -v s="^<!-- guardrails:$name v[0-9]+ -->\$" -v e="^<!-- /guardrails:$name -->\$" '
+    { sub(/\001$/, "") } on { if ($0 ~ e) on = 0; else if ($0 ~ s) again = 1; next } $0 ~ s { on = 1 } END { exit (on || again) ? 3 : 0 }'
+  rc=$?; [ "$rc" = 3 ] && unclosed "$target" "$name"
+  [ "$rc" = 0 ] || unreadable "$target"
+  crlf=; is_crlf "$target" && crlf=1
+  start_swap "$target"
+  tr '\r' '\001' < "$target" | awk -v s="^<!-- guardrails:$name v[0-9]+ -->\$" -v e="^<!-- /guardrails:$name -->\$" -v crlf="$crlf" '
+    function bare(l) { sub(/\001$/, "", l); return l }
+    function out(l) { if (crlf && l !~ /\001$/) l = l "\001"; print l }
+    skip { if (bare($0) ~ e) skip = 0; next }
+    bare($0) ~ s { held = 0; skip = 1; next }
+    held { out(prev); held = 0 }
+    bare($0) == "" { prev = $0; held = 1; next }
+    { out($0) }
+    END { if (held) out(prev) }' | tr '\001' '\r' > "$tmp" && mv "$tmp" "$real" || { rm -f "$tmp"; unwritable "$target"; }
+  echo removed; exit 0
+fi
+block=${1:-}; target=${2:-}
+[ -f "$block" ] && [ -n "$target" ] || { echo "usage: guardrails-write-block <block-file> <target-CLAUDE.md>" >&2; exit 2; }
+first=$(head -1 "$block"); first=${first%"$CR"}
+name=$(printf '%s\n' "$first" | sed -nE 's/^<!-- guardrails:([a-z0-9-]+) v[0-9]+ -->$/\1/p')
+[ -n "$name" ] || { echo "guardrails-write-block: $block does not start with <!-- guardrails:<name> v<N> -->" >&2; exit 2; }
+close="<!-- /guardrails:$name -->"
+# The block as it should appear: LF, no trailing blank lines, then the close.
+new=$(tr -d '\r' < "$block"; printf '\n%s' "$close")
+new=$(printf '%s\n' "$new" | awk -v c="$close" '
+  $0 == c { while (blank > 0) blank--; print; next }
+  /^$/ { blank++; next }
+  { while (blank > 0) { print ""; blank-- } print }')
+
+if [ ! -e "$target" ]; then
+  printf '%s\n' "$new" > "$target" || exit 1
+  echo added; exit 0
+fi
+
+crlf=; is_crlf "$target" && crlf=1
+start="^<!-- guardrails:$name v[0-9]+ -->\$"
+end="^<!-- /guardrails:$name -->\$"
+# Read to the end (no early exit), so a failed tr shows in the status. An open
+# marker inside the block stops it short of a close, so the check below refuses.
+old=$(tr '\r' '\001' < "$target" | awk -v s="$start" -v e="$end" '
+  done { next } { sub(/\001$/, "") } on && $0 ~ s { done = 1; next } $0 ~ s { on = 1 } on { print; if ($0 ~ e) done = 1 }') || unreadable "$target"
+if [ -n "$old" ]; then
+  printf '%s\n' "$old" | tail -1 | grep -qE "^<!-- /guardrails:$name -->\$" || unclosed "$target" "$name"
+  [ "$old" = "$new" ] && { echo unchanged; exit 0; }
+  no_soh "$target" || exit 1
+  start_swap "$target"
+  printf '%s\n' "$new" > "$tmp.block" || { rm -f "$tmp" "$tmp.block"; unwritable "$target"; }
+  # The path through the environment: -v would read a backslash in it as an escape.
+  tr '\r' '\001' < "$target" | GR_BLOCK="$tmp.block" awk -v s="$start" -v e="$end" -v crlf="$crlf" '
+    function bare(l) { sub(/\001$/, "", l); return l }
+    BEGIN {
+      while ((r = (getline l < ENVIRON["GR_BLOCK"])) > 0) blk = blk l "" (crlf ? "\001" : "") "\n"   # "": busybox reads l (...) as a call
+      if (r < 0) exit 2
+    }
+    !done && bare($0) ~ s { printf "%s", blk; skip = 1; next }
+    skip { if (bare($0) ~ e) { skip = 0; done = 1 } next }
+    { if (crlf && $0 !~ /\001$/) $0 = $0 "\001"; print }' | tr '\001' '\r' > "$tmp" && mv "$tmp" "$real"
+  rc=$?; rm -f "$tmp" "$tmp.block"; [ "$rc" = 0 ] || unwritable "$target"
+  echo updated; exit 0
+fi
+
+{
+  eol=$'\n'; [ -n "$crlf" ] && eol=$'\r\n'
+  last=$(tail -c 1 "$target" | od -An -c | tr -d ' ')
+  [ -s "$target" ] && [ "$last" != '\n' ] && printf '%s' "$eol"
+  [ -s "$target" ] && [ -n "$(tail -1 "$target" | tr -d '\r')" ] && printf '%s' "$eol"
+  printf '%s\n' "$new" | while IFS= read -r l; do printf '%s%s' "$l" "$eol"; done
+} >> "$target" || exit 1
+echo added

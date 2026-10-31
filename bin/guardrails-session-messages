@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# guardrails-session-messages -- every message the user sent in one Claude
+# Code session, in order: ordinary turns, the ones typed while a turn was
+# running (stored as queued_command attachments, not user turns), answers to
+# questions (stored as tool results, notes included) and slash or `!`
+# commands. A scan of user turns alone misses the middle two. Skips helper
+# agent (sidechain) entries, meta lines, task notifications and tool output.
+# Reads only; free.
+#
+#   guardrails-session-messages <transcript.jsonl | session id> [--last]
+#       a session id is looked up as ~/.claude/projects/*/<id>.jsonl
+#       --last prints only the last message's timestamp
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/../scripts/lib.sh"
+py=$(gr_python) || { gr_no_python guardrails-session-messages; exit 1; }
+src=${1:?usage: guardrails-session-messages <transcript.jsonl | session id> [--last]}
+if [ ! -f "$src" ]; then
+  found=$(ls "$HOME"/.claude/projects/*/"$src".jsonl 2>/dev/null | head -1)
+  [ -n "$found" ] || { echo "no transcript: $src" >&2; exit 1; }
+  src=$found
+fi
+# Python on Windows cannot open a Git Bash path (/c/...): hand it the native one.
+command -v cygpath >/dev/null 2>&1 && src=$(cygpath -m "$src")
+
+"$py" - "$src" "${2:-}" <<'PY'
+import json, re, sys
+# Windows Python would print in the code page (no "→") and end lines with \r\n.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+
+REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+ONLY_LAST = sys.argv[2] == "--last"
+last = last_ts = None
+
+
+def out(ts, kind, text):
+    global last, last_ts
+    text = REMINDER.sub("", text).strip()
+    if not text or text == last:          # a queued message can come back as a turn
+        return
+    last, last_ts = text, ts
+    if ONLY_LAST:
+        return
+    when = (ts or "")[:16].replace("T", " ")
+    lines = text.splitlines()
+    print(f"{when:16}  {kind:8}  {lines[0]}")
+    for line in lines[1:]:
+        print(" " * 28 + line)
+
+
+def from_turn(ts, text):
+    if text.startswith(("<local-command-stdout>", "<local-command-caveat>", "<task-notification>",
+                        "<bash-stdout>", "<bash-stderr>")):
+        return
+    m = re.search(r"<command-name>(.*?)</command-name>", text, re.S)
+    if m:
+        args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+        return out(ts, "command", (m.group(1) + " " + (args.group(1) if args else "")).strip())
+    m = re.search(r"<bash-input>(.*?)</bash-input>", text, re.S)
+    if m:
+        return out(ts, "shell", "! " + m.group(1).strip())
+    out(ts, "turn", text)
+
+
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if not isinstance(d, dict) or d.get("isSidechain") or d.get("isMeta"):
+        continue
+    ts = d.get("timestamp")
+    a = d.get("attachment") or {}
+    if d.get("type") == "attachment" and a.get("type") == "queued_command":
+        origin = (a.get("origin") or {}).get("kind")
+        if origin == "human" or a.get("humanTurn") or (origin is None and a.get("commandMode") == "prompt"):
+            out(a.get("timestamp") or ts, "mid-turn", str(a.get("prompt", "")))
+        continue
+    if d.get("type") != "user":
+        continue
+    result = d.get("toolUseResult")
+    if isinstance(result, dict) and isinstance(result.get("answers"), dict):
+        notes = result.get("annotations") or {}
+        for q, ans in result["answers"].items():
+            note = (notes.get(q) or {}).get("notes")
+            out(ts, "answer", f"{q} -> {ans}" + (f" (note: {note})" if note else ""))
+        continue
+    if result is not None:
+        continue
+    content = (d.get("message") or {}).get("content")
+    if isinstance(content, str):
+        from_turn(ts, content)
+    elif isinstance(content, list):
+        parts = []
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text":
+                parts.append(c.get("text", ""))
+            elif c.get("type") == "image":
+                parts.append("[image]")
+        if parts:
+            from_turn(ts, " ".join(p.strip() for p in parts if p.strip()))
+
+if ONLY_LAST and last_ts:
+    print(last_ts)
+PY

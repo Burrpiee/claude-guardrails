@@ -1,0 +1,3 @@
+#!/bin/sh
+# On macOS CI, puts /bin/bash (3.2) behind `#!/usr/bin/env bash`.
+exec /bin/bash "$@"

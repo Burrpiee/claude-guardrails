@@ -1,0 +1,11 @@
+{
+  "name": "guardrails",
+  "version": "0.1.0",
+  "description": "Asks before the deploys and spends you name, refuses risky shell habits, checks that a push does not undo recent work, shows each session's state, and hands off cleanly before a long session compacts.",
+  "author": {
+    "name": "Burrpiee"
+  },
+  "repository": "https://github.com/Burrpiee/claude-guardrails",
+  "license": "MIT",
+  "keywords": ["guardrails", "hooks", "handoff", "safety"]
+}

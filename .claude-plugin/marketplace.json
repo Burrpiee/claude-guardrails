@@ -1,0 +1,16 @@
+{
+  "name": "guardrails-tools",
+  "owner": {
+    "name": "Burrpiee"
+  },
+  "metadata": {
+    "description": "Guardrails, session tools and a handoff skill for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "guardrails",
+      "source": "./",
+      "description": "Asks before the deploys and spends you name, refuses risky shell habits, checks that a push does not undo recent work, shows each session's state, and hands off cleanly before a long session compacts."
+    }
+  ]
+}

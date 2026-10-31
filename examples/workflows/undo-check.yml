@@ -1,0 +1,28 @@
+# The undo check on every pull request: fails one that would put files back
+# as they were before the base branch's recent work (a branch rebuilt from an
+# older copy of the files). Copy this file to .github/workflows/ in your
+# project. A meant revert passes with the label `undo-ok` on the pull request.
+# It blocks a merge only if you make `undo-check` a required status check
+# (Settings > Branches). Free on a public repo; on a private one each run is
+# billed as at least one minute of Actions time.
+#
+# To update the check, change `ref:` below to a newer release tag.
+name: undo check
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+permissions:
+  contents: read
+jobs:
+  undo-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: Burrpiee/claude-guardrails
+          ref: v0.1.0
+          path: .guardrails
+      - run: bash .guardrails/scripts/undo-check-ci.sh
