@@ -6,6 +6,11 @@ All notable changes to this plugin are listed here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The README's install steps for a teammate on project scope: the install
+  command alone fails on a clean machine, so the marketplace comes first.
+
 ### Planned
 
 - Eval cases for the session-handoff skill in a later version.

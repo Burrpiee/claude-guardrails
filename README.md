@@ -36,8 +36,14 @@ know; anything else runs as Claude Code would run it anyway.
 ```
 
 Pick **user scope** to have it in every project for yourself, or **project
-scope** to share it with a team; with project scope each teammate also runs
-`claude plugin install guardrails@guardrails-tools --scope project` once.
+scope** to share it with a team. With project scope, each teammate also runs
+these once:
+
+```
+claude plugin marketplace add Burrpiee/claude-guardrails
+claude plugin install guardrails@guardrails-tools --scope project
+```
+
 Then run `/guardrails:setup` in a session.
 
 ## Set up

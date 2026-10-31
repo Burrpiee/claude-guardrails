@@ -50,6 +50,11 @@ mk=$(jq -r .name "$GR_REPO/.claude-plugin/marketplace.json" | tr -d '\r')
 pn=$(jq -r '.plugins[0].name' "$GR_REPO/.claude-plugin/marketplace.json" | tr -d '\r')
 expect "README: the marketplace line" "^/plugin marketplace add $repo\$" "$r"
 expect "README: the install line" "^/plugin install $pn@$mk\$" "$r"
+# ...and a teammate's, the marketplace first: the install alone fails on a clean machine
+expect "README: a teammate's marketplace line" "^claude plugin marketplace add $repo\$" "$r"
+expect "README: a teammate's install line" "^claude plugin install $pn@$mk --scope project\$" "$r"
+tm=$(grep -n '^claude plugin marketplace add' "$RD" | head -1 | cut -d: -f1); ti=$(grep -n '^claude plugin install' "$RD" | head -1 | cut -d: -f1)
+[ -n "$tm" ] && [ -n "$ti" ] && [ "$tm" -lt "$ti" ] && ok || bad "README has a teammate add the marketplace before the install"
 gfw=$(grep -n 'Git for Windows' "$RD" | head -1 | cut -d: -f1); pl=$(grep -n '^/plugin' "$RD" | head -1 | cut -d: -f1)
 [ -n "$gfw" ] && [ -n "$pl" ] && [ "$gfw" -lt "$pl" ] && ok || bad "README names Git for Windows before the first /plugin line"
 for h in '## Updating' '## Uninstalling'; do expect "README has $h" "^$h" "$r"; done
